@@ -16,13 +16,13 @@
  */
 
 import type { Api, AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
-import { stream } from "@earendil-works/pi-ai";
+import { stream } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { extractConversationContext, buildHistory, extractTextFromMessage } from "./recap.js";
-import { findFastModelChain, thinkingOffOpts } from "./picker.js";
-import { addToBlacklist } from "../state/blacklist.js";
-import type { CachedModel } from "../state/state.js";
-import { logDebug, logError, logTrace } from "../util/log.js";
+import { extractConversationContext, buildHistory, extractTextFromMessage } from "./recap.ts";
+import { findFastModelChain, recapRequestOptions, GOAL_MAX_TOKENS } from "./picker.ts";
+import { addToBlacklist } from "../state/blacklist.ts";
+import type { CachedModel } from "../state/state.ts";
+import { logDebug, logError, logTrace } from "../util/log.ts";
 
 const ATTEMPT_TIMEOUT_MS = 15000;
 
@@ -143,9 +143,7 @@ async function streamOnce(
 				{
 					apiKey: auth.apiKey!,
 					headers: auth.headers || {},
-					maxTokens: 64,
-					temperature: 0,
-					...thinkingOffOpts(model),
+					...recapRequestOptions(model, GOAL_MAX_TOKENS),
 				},
 			);
 			for await (const event of events) {

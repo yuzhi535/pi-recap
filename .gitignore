@@ -3,3 +3,10 @@ _tmp/
 state/blacklist.json
 generated/
 state/config.json
+
+# compiled mirrors of the TypeScript sources; jiti loads .ts directly
+index.js
+state/*.js
+subagent/*.js
+ui/*.js
+util/*.js

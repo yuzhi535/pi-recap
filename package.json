@@ -1,64 +1,61 @@
 {
-  "name": "pi-recap",
-  "version": "0.8.22",
-  "description": "Session recap panel for pi coding agent. Always-visible widget showing the current goal and last few conversation turns with live streaming updates. Auto-selects the fastest, cheapest summarization model using pi-bench benchmark data.",
-  "author": "Francesco Frapporti <effedue@gmail.com>",
-  "license": "MIT",
-  "type": "module",
-  "homepage": "https://github.com/Fornace/pi-recap#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Fornace/pi-recap.git"
-  },
-  "bugs": {
-    "url": "https://github.com/Fornace/pi-recap/issues"
-  },
-  "keywords": [
-    "pi",
-    "pi-package",
-    "pi-extension",
-    "pi-coding-agent",
-    "recap",
-    "session-summary",
-    "session-recap",
-    "tui",
-    "tui-widget",
-    "terminal-ui",
-    "summarization",
-    "llm",
-    "model-picker",
-    "fast-model",
-    "cheap-model"
-  ],
-  "files": [
-    "index.ts",
-    "state/*.ts",
-    "state/*.js",
-    "state/blacklist.json",
-    "subagent",
-    "ui",
-    "util",
-    "README.md",
-    "LICENSE"
-  ],
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
-  "dependencies": {
-    "pi-bench": "^0.2.1"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "@types/node": "^25.6.2",
-    "typescript": "^6.0.3"
-  }
+	"name": "pi-recap",
+	"version": "0.9.0",
+	"description": "Session recap panel for pi coding agent — fork build: mouse interaction, fullscreen top pin, session-switch crash guard, and request options for reasoning models. Vendors pi-bench data so it loads without a global install.",
+	"author": "Francesco Frapporti <effedue@gmail.com>",
+	"license": "MIT",
+	"type": "module",
+	"homepage": "https://github.com/yuzhi535/pi-recap#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/yuzhi535/pi-recap.git"
+	},
+	"bugs": {
+		"url": "https://github.com/yuzhi535/pi-recap/issues"
+	},
+	"keywords": [
+		"pi",
+		"pi-package",
+		"pi-extension",
+		"pi-coding-agent",
+		"recap",
+		"session-summary",
+		"session-recap",
+		"tui",
+		"tui-widget",
+		"terminal-ui",
+		"summarization",
+		"llm",
+		"model-picker",
+		"fast-model",
+		"cheap-model"
+	],
+	"files": [
+		"index.ts",
+		"state",
+		"subagent",
+		"ui",
+		"util",
+		"vendor",
+		"README.md",
+		"LOCAL-CHANGES.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"@types/node": "^25.6.2",
+		"typescript": "^6.0.3"
+	}
 }

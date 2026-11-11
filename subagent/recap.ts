@@ -21,12 +21,12 @@
  */
 
 import type { Api, AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
-import { stream } from "@earendil-works/pi-ai";
+import { stream } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
-import { findFastModelChain, thinkingOffOpts } from "./picker.js";
-import { addToBlacklist } from "../state/blacklist.js";
-import type { CachedModel } from "../state/state.js";
-import { logDebug, logError, logTrace } from "../util/log.js";
+import { findFastModelChain, recapRequestOptions, RECAP_MAX_TOKENS } from "./picker.ts";
+import { addToBlacklist } from "../state/blacklist.ts";
+import type { CachedModel } from "../state/state.ts";
+import { logDebug, logError, logTrace } from "../util/log.ts";
 
 /** Per-attempt timeout. Anything slower than this on a non-sacred candidate
  *  gets auto-blacklisted; cached/override/ctx.model candidates only get the
@@ -361,9 +361,7 @@ async function runOneAttempt(
 				{
 					apiKey,
 					headers,
-					maxTokens: 256,
-					temperature: 0,
-					...thinkingOffOpts(model),
+					...recapRequestOptions(model, RECAP_MAX_TOKENS),
 				},
 			);
 			for await (const event of events) {

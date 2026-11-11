@@ -16,8 +16,8 @@
  *     curated chain instead of trusting an unbounded-age cache.
  */
 
-import type { CachedModel, GoalSource, Speaker, StatusState } from "./state.js";
-import { EMPTY_STATE } from "./state.js";
+import type { CachedModel, GoalSource, Speaker, StatusState } from "./state.ts";
+import { EMPTY_STATE } from "./state.ts";
 
 interface CachedShape {
 	id?: unknown;

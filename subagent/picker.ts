@@ -24,10 +24,72 @@
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { type CachedModel, isCachedModelFresh } from "../state/state.js";
-import { isBlacklisted } from "../state/blacklist.js";
-import { CURATED_CHAIN } from "pi-bench";
+import { type CachedModel, isCachedModelFresh } from "../state/state.ts";
+import { isBlacklisted } from "../state/blacklist.ts";
+import { CURATED_CHAIN } from "../vendor/pi-bench/data.ts";
 
+/**
+ * Rewrite the outgoing provider payload, adding one field.
+ *
+ * pi's OpenAI-compatible adapter invokes `onPayload` after it builds the
+ * request body, and a non-undefined return value replaces that body. The
+ * recap budgets are tiny (64 tokens for the goal, 256 for a recap), so a
+ * model that spends its first tokens on reasoning returns empty text. This
+ * hook is what keeps that budget for the answer itself.
+ */
+function injectPayloadField(field: string, value: unknown) {
+	return {
+		onPayload: (payload: unknown) => {
+			if (!payload || typeof payload !== "object") return undefined;
+			return { ...(payload as Record<string, unknown>), [field]: value };
+		},
+	};
+}
+
+/**
+ * Remove one field from the final request body.
+ *
+ * Used where the provider rejects a field the adapter would otherwise send.
+ * Deleting it here is the last step before the request leaves, so a model
+ * config that carries its own sampling parameters cannot reintroduce it.
+ */
+function dropPayloadField(field: string) {
+	return {
+		onPayload: (payload: unknown) => {
+			if (!payload || typeof payload !== "object") return undefined;
+			if (!(field in (payload as Record<string, unknown>))) return undefined;
+			const next = { ...(payload as Record<string, unknown>) };
+			delete next[field];
+			return next;
+		},
+	};
+}
+
+/**
+ * Per-provider switch that keeps a reasoning model from spending the recap
+ * budget before it writes an answer.
+ *
+ * This is a per-family workaround for the endpoints we actually call, not a
+ * statement that every model behind a protocol supports the same knob.
+ *
+ *   - anthropic-messages: the adapter's own thinking switch, off.
+ *   - google: the adapter's own thinking switch, off.
+ *   - openai-completions: the adapter only emits a thinking field for endpoint
+ *     flavours it recognises (a DeepSeek base URL, a native provider). A
+ *     generic gateway is not recognised, so nothing is sent and the server
+ *     keeps thinking on by default. We inject the switch for recap calls only,
+ *     leaving the user's normal sessions untouched:
+ *       * DeepSeek served that way accepts a real off switch, so send it.
+ *       * GLM served that way rejects every explicit off switch and only
+ *         accepts a reasoning effort level, so send its lowest accepted level.
+ *         On the gateway we use, that level was measured to leave the answer
+ *         intact under a 256-token budget; it is not a claim that every GLM
+ *         deployment behaves the same way.
+ *   - openai-responses: reasoning models take `reasoning.effort`, which the
+ *     adapter writes when `reasoningEffort` is set. The same models reject
+ *     `temperature`, so the request builder below never sends it and the
+ *     payload hook removes it if anything else added it.
+ */
 export function thinkingOffOpts(model: Model<Api>): Record<string, unknown> {
 	switch (model.api) {
 		case "anthropic-messages":
@@ -35,15 +97,57 @@ export function thinkingOffOpts(model: Model<Api>): Record<string, unknown> {
 		case "google-generative-ai":
 		case "google-vertex":
 			return { thinking: { enabled: false } };
+		case "openai-completions": {
+			if (!model.reasoning) return {};
+
+			if (/deepseek/i.test(model.id)) {
+				return injectPayloadField("thinking", { type: "disabled" });
+			}
+
+			if (/glm/i.test(model.id)) {
+				return injectPayloadField("reasoning_effort", "low");
+			}
+
+			return {};
+		}
+		case "openai-responses": {
+			if (!model.reasoning) return {};
+			return { reasoningEffort: "low", ...dropPayloadField("temperature") };
+		}
 		default:
 			return {};
 	}
 }
 
+/** Output budget for the turn recap. Unchanged from the upstream build. */
+export const RECAP_MAX_TOKENS = 256;
+
+/** Output budget for the auto-derived session title. Unchanged upstream. */
+export const GOAL_MAX_TOKENS = 64;
+
+/**
+ * The one options object both summary call sites hand to `stream()`.
+ *
+ * Recap budgets are tiny (64 tokens for the title, 256 for a recap) and a
+ * reasoning model that burns them before answering produces empty text, so
+ * every call goes through here: fixed budget, deterministic sampling, and the
+ * thinking switch above.
+ *
+ * `temperature` is sent as 0 for every protocol that accepts it. OpenAI
+ * Responses reasoning models reject it, so it is omitted there entirely -- not
+ * set to undefined and hoped away -- and the payload hook enforces that.
+ */
+export function recapRequestOptions(model: Model<Api>, maxTokens: number): Record<string, unknown> {
+	const base: Record<string, unknown> = { maxTokens };
+	const stripsTemperature = model.api === "openai-responses" && model.reasoning;
+	if (!stripsTemperature) base.temperature = 0;
+	return { ...base, ...thinkingOffOpts(model) };
+}
+
 // ── CURATED CHAIN ──────────────────────────────────────────────────────
 //
-// Imported from pi-bench (the source of truth for bench data).
-// Run a new bench → pi-bench updates CURATED_CHAIN → pi-recap picks it up.
+// Vendored pi-bench data (see vendor/pi-bench/data.ts). Re-exported so the
+// rest of the extension keeps one import site for the chain.
 
 export { CURATED_CHAIN };
 

@@ -29,7 +29,7 @@ import {
 	type Speaker,
 	type StatusNotice,
 	type StatusState,
-} from "./state.js";
+} from "./state.ts";
 
 const sessions = new Map<string, StatusState>();
 

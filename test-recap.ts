@@ -1,5 +1,5 @@
-import { generateUserRecap, generateAgentRecap } from "./subagent/recap.js";
-import { deriveGoalInitial } from "./subagent/goal.js";
+import { generateUserRecap, generateAgentRecap } from "./subagent/recap.ts";
+import { deriveGoalInitial } from "./subagent/goal.ts";
 
 const mockRegistry = {
   getAvailable: () => [

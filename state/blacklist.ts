@@ -19,8 +19,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
-import { logDebug, logError } from "../util/log.js";
-import { BLACKLIST_SEED } from "pi-bench";
+import { logDebug, logError } from "../util/log.ts";
+import { BLACKLIST_SEED } from "../vendor/pi-bench/data.ts";
 
 export interface BlacklistEntry {
 	id: string;

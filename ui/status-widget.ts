@@ -1,5 +1,17 @@
 /**
- * Recap surface, mounted aboveEditor.
+ * Recap surface.
+ *
+ * Placement (driven by the `position` setting in state/config.ts):
+ *   - "aboveEditor" (default): the host's above-editor widget slot, the place
+ *     every earlier version used.
+ *   - "top": a fullscreen window's root is a stack of [transcript, dock]. The
+ *     panel is inserted as that stack's FIRST entry, so it takes row 1 of the
+ *     window, the transcript below it absorbs the remaining rows and scrolls on
+ *     its own, and the panel stays put while the chat scrolls. The host's
+ *     above-editor slot then renders nothing.
+ *   Regular (non-fullscreen) TUIs have no window root to pin to, so "top"
+ *   degrades to the above-editor slot. syncPlacement() reconciles the two per
+ *   frame; setPosition() applies a changed setting immediately.
  *
  * Visual language (v4):
  *   - The whole panel is wrapped in a single rounded card. Glyphs ╭ ╮ ╰ ╯ ─ │
@@ -8,9 +20,14 @@
  *   - Title cuts into the top border on the left. Model tag cuts in on the
  *     right with a `*` suffix when locked via /recap-model. A pristine session
  *     (no goal yet) renders the placeholder dim+italic in the same slot.
- *   - Bottom border carries a contextual focus hint: "ctrl+shift+r focus"
- *     when not focused, "↑↓ navigate · esc release [+N older]" when focused.
- *     Always visible. Solves the v3 complaint that the hint was invisible.
+ *   - Bottom border carries a contextual hint: "click or scroll" when idle,
+ *     "↑↓/wheel scroll · click/esc release" when focused. Always visible.
+ *     Solves the v3 complaint that the hint was invisible, and advertises the
+ *     mouse affordances for terminals where ctrl+shift+r never arrives.
+ *   - Mouse: the panel implements handleMouse, so a wheel over it pages
+ *     through older entries and a left press focuses it / selects the clicked
+ *     row / releases it. Typing anything hands focus back to the editor and
+ *     replays the keystroke, so no Esc is needed to resume composing.
  *   - Interior rows: 1 space inside each border. Then a fixed-width time
  *     column (right-aligned, dim), 2 spaces, a 3-cell speaker tag colored
  *     per role (you = borderAccent blue, pi = accent purple), 2 spaces,
@@ -40,13 +57,31 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth, matchesKey, Key } from "@earendil-works/pi-tui";
-import { clearNotice, getActiveState, getActiveSessionId } from "../state/store.js";
-import type { HistoryEntry, Speaker } from "../state/state.js";
-import { formatDate } from "../util/date.js";
-import { fgAnsi, parseHex, rgbLerp, RESET, type RGB, newestColor, textColor, colorText, isLightBg } from "./anim.js";
+import { clearNotice, getActiveState, getActiveSessionId } from "../state/store.ts";
+import { getGlobalPosition, DEFAULT_PANEL_POSITION, type PanelPosition } from "../state/config.ts";
+import type { HistoryEntry, Speaker } from "../state/state.ts";
+import { formatDate } from "../util/date.ts";
+import { fgAnsi, parseHex, rgbLerp, RESET, type RGB, newestColor, textColor, colorText, isLightBg } from "./anim.ts";
 
 const WIDGET_KEY = "recap";
 const VIEW_SIZE = 4;
+
+/** Resolve the panel position defensively. Under some module-load orders the
+ *  imported getter can still be undefined when this class's field initializers
+ *  run (circular import through state/config). Throwing "getGlobalPosition is
+ *  not a function" there crashes the whole panel, so fall back to the default
+ *  instead of trusting the import blindly. */
+function resolvePanelPosition(): PanelPosition {
+	try {
+		if (typeof getGlobalPosition === "function") {
+			const resolved = getGlobalPosition();
+			if (resolved === "top" || resolved === "aboveEditor") return resolved;
+		}
+	} catch {
+		// Config unreadable — fall through to the default.
+	}
+	return DEFAULT_PANEL_POSITION;
+}
 
 const TICK_MS = 80;
 const THINK_GRACE_MS = 200;
@@ -93,6 +128,121 @@ interface EntryAnim {
 	finalizedAt?: number;
 }
 
+/** The slice of pi-tui's mouse event the panel reads. Declared structurally on
+ *  purpose: pi-tui only gained the mouse API in 1.x, and this file must keep
+ *  compiling against older dev installs (types are erased at runtime, and the
+ *  host passes the real event object through unchanged). */
+interface MouseEventLike {
+	type: "press" | "release" | "move" | "drag" | "click" | "wheel";
+	button: "left" | "middle" | "right" | "none";
+	/** Zero-based row inside this component, counting the decoy row above the card. */
+	y: number;
+	/** Logical lines; negative scrolls up. */
+	wheelDelta?: number;
+}
+
+/** The slice of pi-tui's mouse result the panel returns. */
+interface MouseResultLike {
+	handled?: boolean;
+	capture?: boolean;
+	focus?: boolean;
+	render?: boolean;
+}
+
+/** Where the card's rows landed in the last render() call. Mouse coordinates
+ *  arrive relative to the component's own top edge, so hit-testing needs the
+ *  same row numbering the terminal is showing right now: the decoy row sits
+ *  above the card and shifts everything down by one, and short histories
+ *  render fewer than VIEW_SIZE content rows. */
+interface RowMap {
+	/** Row index of the first interior (recap) row. */
+	firstHistoryRow: number;
+	/** How many interior rows are recap entries. */
+	historyRows: number;
+	/** True when those interior rows are selectable recap entries (not bench /
+	 *  setup / empty-placeholder content). */
+	interactive: boolean;
+}
+
+// ── Fullscreen top-pin plumbing ───────────────────────────────────────
+//
+// A fullscreen window's root is a VStack whose entries are [transcript,
+// dock]. The above-editor slot lives inside `dock`, so anything mounted there
+// renders just above the input box and is laid out in the same column as the
+// chat. To pin the panel to the very top of the window instead, it is added as
+// the root's first entry: it takes its natural height at row 1 and the
+// transcript below it absorbs the remaining rows and scrolls on its own.
+//
+// Both arrays are maintained because the root stack reads `entries` for layout
+// and `children` for traversal/invalidate. `Stack.addChild` keeps the two in
+// sync but only appends, so the front insertion is done by hand.
+
+/** Structural view of one root-stack entry (the fields layout reads). */
+interface RootStackEntryLike {
+	component: Component;
+	basis?: number | "auto";
+	grow?: number;
+	shrink?: number;
+	minSize?: number;
+	maxSize?: number;
+	visible?: (viewport: { width: number; height: number }) => boolean;
+}
+
+/** Structural view of the fullscreen root stack. The host keeps the real class
+ *  private, so only the two arrays the layering depends on are used. */
+interface RootStackLike extends Component {
+	entries: RootStackEntryLike[];
+	children: Component[];
+}
+
+/** The window's root stack, when this TUI has one (fullscreen only). */
+function readRootStack(tui: TUI | undefined): RootStackLike | undefined {
+	if (!tui) return undefined;
+	const root = (tui as unknown as { layoutRoot?: unknown }).layoutRoot;
+	if (!root || typeof root !== "object") return undefined;
+	const stack = root as RootStackLike;
+	if (!Array.isArray(stack.entries) || !Array.isArray(stack.children)) return undefined;
+	return stack;
+}
+
+/** The component handed to the host's above-editor slot.
+ *
+ * It renders the panel only while the panel is not pinned to the window top,
+ * and it is a thin proxy on purpose: a host-side dispose (re-registration or a
+ * TUI mode switch) drops this slot without tearing down the panel itself. */
+class HostSlot implements Component {
+	private owner: StatusWidget | undefined;
+
+	constructor(owner: StatusWidget) {
+		this.owner = owner;
+	}
+
+	render(width: number): string[] {
+		const owner = this.owner;
+		if (!owner) return [];
+		// The slot is rendered once per frame, which is exactly how often a mode
+		// switch (fullscreen <-> regular) can be noticed without polling.
+		owner.syncPlacement();
+		if (owner.isPinnedToTop) return [];
+		return owner.render(width);
+	}
+
+	invalidate(): void {
+		this.owner?.invalidate();
+	}
+
+	/** Forward mouse events to the panel. Coordinates already match: this slot
+	 *  renders the panel's lines verbatim, so y=0 is the panel's first row. */
+	handleMouse(event: MouseEventLike): MouseResultLike | undefined {
+		return this.owner?.handleMouse(event);
+	}
+
+	/** Host-driven removal: drop the link only, never the panel. */
+	dispose(): void {
+		this.owner = undefined;
+	}
+}
+
 export class StatusWidget implements Component {
 	private uiCtx: ExtensionUIContext | undefined;
 	private widgetRegistered = false;
@@ -112,6 +262,8 @@ export class StatusWidget implements Component {
 	private focused = false;
 	private scrollOffset = 0;
 	private selectedRow = VIEW_SIZE - 1;
+	/** Row numbering of the last painted frame, used by handleMouse(). */
+	private rowMap: RowMap | undefined;
 
 	/** Per-entry animation timing. Keyed by entry id. Populated lazily on
 	 *  first render of a streaming row, updated on each render based on the
@@ -154,10 +306,29 @@ export class StatusWidget implements Component {
 	 *  animation timer from painting stale frames over the overlay. */
 	private renderingPaused = false;
 
+	/** Where the panel wants to live. Seeded from config.json so a restart keeps
+	 *  the user's choice; changed at runtime by setPosition(). */
+	private position: PanelPosition = resolvePanelPosition();
+	/** Fullscreen only: the root stack the panel was inserted into, and the
+	 *  exact entry that was added, so removal is precise and repeat-safe. */
+	private pinnedRoot: RootStackLike | undefined;
+	private pinnedEntry: RootStackEntryLike | undefined;
+	/** True while the panel renders as the window's first row. */
+	private pinnedTop = false;
+	/** The thin component registered in the host's above-editor slot. */
+	private hostSlot: HostSlot | undefined;
+	/** Deferred re-registration after the placement changed (mode switch). */
+	private remountTimer: ReturnType<typeof setTimeout> | undefined;
+
 	// ── Lifecycle wiring (called from index.ts) ───────────────────────
 
 	setUICtx(ctx: ExtensionUIContext): void {
 		if (ctx !== this.uiCtx) {
+			// Renderer or session changed: drop the old insertion and slot while
+			// the old tui reference is still live, then re-register on next use.
+			this.unpinFromWindowTop();
+			this.hostSlot?.dispose();
+			this.hostSlot = undefined;
 			this.uiCtx = ctx;
 			this.widgetRegistered = false;
 			this.tui = undefined;
@@ -173,6 +344,42 @@ export class StatusWidget implements Component {
 		return this.focused;
 	}
 
+	/** True while the panel is mounted as the first row of a fullscreen window. */
+	get isPinnedToTop(): boolean {
+		return this.pinnedTop;
+	}
+
+	/** Current placement, including the above-editor fallback. */
+	getPosition(): PanelPosition {
+		return this.position;
+	}
+
+	/** Apply a new placement without a restart. The caller persists the setting
+	 *  (state/config.ts) and this call only moves the card. */
+	setPosition(pos: PanelPosition): void {
+		const changed = this.position !== pos;
+		this.position = pos;
+		if (!changed) return;
+		// The card may move by a row or two; bump the sentinel so pi-tui repaints
+		// every row instead of trusting a stale frame.
+		this.bumpDecoy();
+		const tui = this.tui;
+		if (!tui) {
+			// Not mounted yet (no UI, or before the first update()): the next
+			// registration reads `position` and places the panel correctly.
+			return;
+		}
+		if (pos === "top") {
+			// No window root (regular TUI): stays in the above-editor slot.
+			this.pinToWindowTop(tui);
+		} else {
+			// Unpinning is all it takes to come back: the slot proxy renders the
+			// panel again on the next frame.
+			this.unpinFromWindowTop();
+		}
+		tui.requestRender(true);
+	}
+
 	/** Called whenever state changes (replay, recap commit, /goal, every
 	 *  delta from a stream). Idempotent: registers the widget once, then
 	 *  just kicks a re-render. */
@@ -180,17 +387,11 @@ export class StatusWidget implements Component {
 		if (this.disposed) return;
 		if (!this.uiCtx) return;
 		if (!this.widgetRegistered) {
-			this.uiCtx.setWidget(
-				WIDGET_KEY,
-				(tui, theme) => {
-					this.tui = tui;
-					this.currentTheme = theme;
-					return this;
-				},
-				{ placement: "aboveEditor" },
-			);
-			this.widgetRegistered = true;
+			this.registerWidget();
 		} else {
+			// Cheap: returns immediately unless the window changed shape or the
+			// position setting changed under us.
+			this.syncPlacement();
 			// On the very first delta after registration, force a full redraw
 			// to clear pi-tui's frame cache. This prevents the stale initial
 			// frame (empty widget) from remaining visible as a ghost top border
@@ -204,6 +405,101 @@ export class StatusWidget implements Component {
 			}
 		}
 		this.ensureAnimTimer();
+	}
+
+	/** Register the host-slot component. The factory decides, on every
+	 *  registration, where the panel goes: pinned to the window top or left in
+	 *  the host's above-editor slot. */
+	private registerWidget(): void {
+		const ctx = this.uiCtx;
+		if (!ctx) return;
+		const slot = new HostSlot(this);
+		this.hostSlot = slot;
+		ctx.setWidget(
+			WIDGET_KEY,
+			(tui, theme) => {
+				this.tui = tui;
+				this.currentTheme = theme;
+				if (this.position === "top") this.pinToWindowTop(tui);
+				return slot;
+			},
+			{ placement: "aboveEditor" },
+		);
+		this.widgetRegistered = true;
+	}
+
+	/** Insert the panel as the window's first row. No-op (returns false) in a
+	 *  regular TUI, where there is no root stack to pin to. */
+	private pinToWindowTop(tui: TUI): boolean {
+		const root = readRootStack(tui);
+		if (!root) return false; // regular TUI: no window root to pin to
+		// Already inserted into this exact root: keep it, do not duplicate.
+		if (this.pinnedRoot === root && this.pinnedEntry && root.entries.indexOf(this.pinnedEntry) !== -1) {
+			this.pinnedTop = true;
+			return true;
+		}
+		this.unpinFromWindowTop();
+		const entry: RootStackEntryLike = {
+			component: this,
+			basis: "auto",
+			grow: 0,
+			shrink: 1,
+			minSize: 0,
+		};
+		root.entries.unshift(entry);
+		root.children.unshift(this);
+		this.pinnedRoot = root;
+		this.pinnedEntry = entry;
+		this.pinnedTop = true;
+		root.invalidate();
+		tui.requestRender(true);
+		return true;
+	}
+
+	/** Remove the panel from the window root. No-op when it was never pinned. */
+	private unpinFromWindowTop(): void {
+		const root = this.pinnedRoot;
+		const entry = this.pinnedEntry;
+		this.pinnedRoot = undefined;
+		this.pinnedEntry = undefined;
+		this.pinnedTop = false;
+		if (!root) return;
+		if (entry) {
+			const index = root.entries.indexOf(entry);
+			if (index !== -1) root.entries.splice(index, 1);
+		}
+		const childIndex = root.children.indexOf(this);
+		if (childIndex !== -1) root.children.splice(childIndex, 1);
+		root.invalidate();
+		this.tui?.requestRender(true);
+	}
+
+	/** Reconcile where the panel lives. Returns immediately when nothing
+	 *  changed, so it is safe to call once per rendered frame. */
+	syncPlacement(): void {
+		if (this.disposed) return;
+		const root = readRootStack(this.tui);
+		const wantPinnedTop = this.position === "top" && root !== undefined;
+		if (wantPinnedTop) {
+			// Already inserted into this exact root: nothing to do.
+			if (this.pinnedRoot === root && this.pinnedEntry && root.entries.indexOf(this.pinnedEntry) !== -1) return;
+		} else if (this.pinnedRoot === undefined) {
+			// Nothing pinned, nothing to pin: the host slot is already right.
+			return;
+		}
+		// The window changed shape under us (fullscreen <-> regular, or a rebuilt
+		// renderer), or the position setting flipped: drop the stale insertion and
+		// re-register so the widget factory can place the panel again.
+		this.unpinFromWindowTop();
+		this.widgetRegistered = false;
+		if (this.remountTimer !== undefined) return;
+		// Deferred: this can run from inside the host's dock render, and
+		// mutating the widget slot mid-render would rebuild a container that is
+		// currently being iterated.
+		this.remountTimer = setTimeout(() => {
+			this.remountTimer = undefined;
+			if (!this.disposed) this.update();
+		}, 0);
 	}
 
 	/** Called by index.ts to push bench progress into the widget interior.
@@ -244,7 +540,8 @@ export class StatusWidget implements Component {
 		this.renderingPaused = false;
 	}
 
-	/** Bound to the ctrl+shift+r shortcut. Toggles focus. Snap, never animate. */
+	/** Bound to the ctrl+shift+r shortcut (and to clicks on the card). Toggles
+	 *  focus. Snap, never animate. */
 	toggleFocus(): void {
 		if (!this.tui) return;
 		const history = getActiveState().history;
@@ -252,7 +549,8 @@ export class StatusWidget implements Component {
 			if (history.length === 0) return;
 			this.focused = true;
 			this.scrollOffset = 0;
-			this.selectedRow = Math.min(VIEW_SIZE - 1, history.length - 1);
+			this.selectedRow = VIEW_SIZE - 1;
+			this.clampSelectedRow(history.length);
 			// Capture the current focus target (typically the host editor) so
 			// releaseFocus() can hand it back. TUI.focusedComponent is private
 			// in the TS surface but a plain field at runtime.
@@ -264,6 +562,50 @@ export class StatusWidget implements Component {
 		this.tui.requestRender();
 	}
 
+	/** Take focus and point the selection at one visible row. Shared by the
+	 *  keyboard shortcut and the mouse press path; keeps the previously focused
+	 *  component so releaseFocus() can hand it back. */
+	private grabFocus(rowIndex: number): void {
+		const tui = this.tui;
+		if (!tui) return;
+		if (!this.focused) {
+			const current = (tui as unknown as { focusedComponent: Component | null }).focusedComponent;
+			this.previousFocus = current && current !== this ? current : null;
+			this.focused = true;
+			tui.setFocus(this);
+		}
+		this.selectedRow = rowIndex;
+		this.clampSelectedRow();
+	}
+
+	/** Number of recap rows the current scroll offset actually shows. */
+	private visibleCount(total = getActiveState().history.length): number {
+		return Math.min(VIEW_SIZE, Math.max(0, total - this.scrollOffset));
+	}
+
+	/** Keep selectedRow inside the visible window after any scroll change. */
+	private clampSelectedRow(total = getActiveState().history.length): void {
+		const count = this.visibleCount(total);
+		this.selectedRow = count === 0 ? 0 : Math.max(0, Math.min(count - 1, this.selectedRow));
+	}
+
+	/** Re-derive the focused flag from the renderer.
+	 *
+	 *  A click on the editor or transcript hands focus elsewhere without ever
+	 *  calling into this component (pi-tui dispatches the synthesized click
+	 *  straight to the new target). Without this check the panel would keep its
+	 *  selection marker and focused hint, and a later click would take the
+	 *  "already focused" branch while the keyboard actually lives elsewhere. */
+	private syncFocusFromTui(): void {
+		if (!this.focused) return;
+		const tui = this.tui as unknown as { getFocusedComponent?: () => Component | null } | undefined;
+		if (!tui || typeof tui.getFocusedComponent !== "function") return;
+		if (tui.getFocusedComponent() !== this) {
+			this.focused = false;
+			this.previousFocus = null;
+		}
+	}
+
 	/** Release keyboard focus and hand it back to whatever was focused before
 	 *  the widget grabbed it (the editor in normal interactive mode). Never
 	 *  call setFocus(null) here — that leaves the TUI with no focused
@@ -272,6 +614,7 @@ export class StatusWidget implements Component {
 		this.focused = false;
 		this.tui?.setFocus(this.previousFocus);
 		this.previousFocus = null;
+		this.clampSelectedRow();
 	}
 
 	dispose(): void {
@@ -283,12 +626,25 @@ export class StatusWidget implements Component {
 		this.renderingPaused = false;
 		this.stopAnimTimer();
 		this.stopSlowTimer();
+		if (this.remountTimer !== undefined) {
+			clearTimeout(this.remountTimer);
+			this.remountTimer = undefined;
+		}
+		const tui = this.tui;
 		const ctx = this.uiCtx;
+		// Remove the top-slot insertion before dropping the tui reference so the
+		// freed rows are cleared on screen.
+		this.unpinFromWindowTop();
+		this.hostSlot?.dispose();
+		this.hostSlot = undefined;
+		tui?.requestRender(true);
 		this.widgetRegistered = false;
 		this.tui = undefined;
 		this.currentTheme = undefined;
 		this.uiCtx = undefined;
 		this.focused = false;
+		this.previousFocus = null;
+		this.rowMap = undefined;
 		this.entryAnim.clear();
 		this.lastSeenText.clear();
 		this.wasStreaming.clear();
@@ -300,6 +656,9 @@ export class StatusWidget implements Component {
 	render(width: number): string[] {
 		const theme = this.currentTheme;
 		if (!theme) return [];
+		// A focus change outside this component (click on the editor, an overlay
+		// taking over) must drop the selection chrome on the next frame.
+		this.syncFocusFromTui();
 		// Rounded card needs at least the two corners + 1 cell of horizontal
 		// payload between them. Below that we just emit nothing.
 		if (width < 4) return [];
@@ -357,12 +716,18 @@ export class StatusWidget implements Component {
 		// alternative — a ghosted duplicate status box — is worse.
 		this.decoyTick = (this.decoyTick + 1) % 8;
 		this.lastHistoryLength = history.length;
-		lines.push(" ".repeat(1 + this.decoyTick));
+		// Pinned to row 1 the panel never shifts vertically, so the scrollback
+		// ghost this decoy guards against cannot happen -- and emitting it would
+		// push the card's top border off the first screen row.
+		if (!this.pinnedTop) lines.push(" ".repeat(1 + this.decoyTick));
 
 		const liveNotice = state.notice && state.notice.expiresAt > now ? state.notice : undefined;
 		lines.push(
 			this.renderTopBorder(theme, width, goal, state.lastModel, state.modelOverride, liveNotice?.text),
 		);
+		// Everything pushed from here to the bottom border is a card interior row;
+		// the branches below record how many of those rows are recap entries.
+		const firstHistoryRow = lines.length;
 
 		const innerWidth = Math.max(0, width - 2 * (1 + BORDER_PAD)); // border+pad on each side
 
@@ -378,6 +743,7 @@ export class StatusWidget implements Component {
 			for (let i = benchVisible.length; i < VIEW_SIZE; i++) {
 				lines.push(this.padRow(theme, width, ""));
 			}
+			this.rowMap = { firstHistoryRow, historyRows: 0, interactive: false };
 			lines.push(this.renderBottomBorder(theme, width, history.length));
 			return lines;
 		}
@@ -399,6 +765,7 @@ export class StatusWidget implements Component {
 			for (let i = setupLines.length; i < VIEW_SIZE; i++) {
 				lines.push(this.padRow(theme, width, ""));
 			}
+			this.rowMap = { firstHistoryRow, historyRows: 0, interactive: false };
 			lines.push(this.renderBottomBorder(theme, width, history.length));
 			return lines;
 		}
@@ -444,7 +811,88 @@ export class StatusWidget implements Component {
 
 		lines.push(this.renderBottomBorder(theme, width, total));
 
+		this.rowMap = {
+			firstHistoryRow,
+			historyRows: visible.length,
+			interactive: visible.length > 0,
+		};
+
 		return lines;
+	}
+
+	// ── Mouse ─────────────────────────────────────────────────────────
+
+	/**
+	 * Mouse contract (pi-tui calls this for events inside the panel's layout
+	 * box: the above-editor widget container forwards them with local
+	 * coordinates, where y=0 is the decoy row above the top border):
+	 *   - wheel: page through older / newer recap entries without needing focus
+	 *     first, and swallow the event so the transcript underneath stays put.
+	 *   - left press on an entry row: focus + select it; press the already
+	 *     selected row to release; press a frame row to toggle focus.
+	 * Focus is moved with tui.setFocus() here instead of returning
+	 * `focus: true`, so releaseFocus() can hand the keyboard back to the exact
+	 * component that had it.
+	 */
+	handleMouse(event: MouseEventLike): MouseResultLike | undefined {
+		if (this.disposed || this.renderingPaused) return undefined;
+		if (event.type === "wheel") return this.handleWheel(event);
+		if (event.type !== "press" || event.button !== "left") return undefined;
+		return this.handlePress(event);
+	}
+
+	private handleWheel(event: MouseEventLike): MouseResultLike | undefined {
+		const total = getActiveState().history.length;
+		const maxOffset = Math.max(0, total - VIEW_SIZE);
+		const delta = event.wheelDelta ?? 0;
+		if (delta === 0) return undefined;
+		if (maxOffset === 0) {
+			// Nothing older to show. When focused the panel still owns the wheel
+			// (arrows and wheel do the same thing); when idle the host keeps it so
+			// the transcript still scrolls under a pointer resting on the card.
+			return this.focused ? { handled: true, render: false } : undefined;
+		}
+		const step = Math.max(1, Math.min(VIEW_SIZE, Math.abs(delta)));
+		const next = delta < 0
+			? Math.min(maxOffset, this.scrollOffset + step) // wheel up: older entries
+			: Math.max(0, this.scrollOffset - step); // wheel down: newer entries
+		if (next === this.scrollOffset) {
+			// Already at an end of the history: consume anyway so the wheel does
+			// not fall through and scroll the chat behind the panel.
+			return { handled: true, render: false };
+		}
+		this.scrollOffset = next;
+		this.clampSelectedRow(total);
+		this.tui?.requestRender();
+		return { handled: true, render: true };
+	}
+
+	private handlePress(event: MouseEventLike): MouseResultLike | undefined {
+		const map = this.rowMap;
+		if (!map) return undefined;
+		this.syncFocusFromTui();
+		const total = getActiveState().history.length;
+		const rowIndex = event.y - map.firstHistoryRow;
+		const onEntryRow = map.interactive && rowIndex >= 0 && rowIndex < map.historyRows;
+
+		if (onEntryRow) {
+			if (!this.focused) {
+				this.grabFocus(rowIndex);
+			} else if (rowIndex === this.selectedRow) {
+				// Second click on the row already selected: done reading.
+				this.releaseFocus();
+			} else {
+				this.selectedRow = rowIndex;
+			}
+			this.tui?.requestRender();
+			return { handled: true, render: true };
+		}
+
+		// Frame rows (top / bottom border, blank filler, bench or setup body)
+		// have nothing to select: a press there just toggles focus.
+		if (!this.focused && total === 0) return undefined;
+		this.toggleFocus();
+		return { handled: true, render: true };
 	}
 
 	handleInput(data: string): void {
@@ -463,26 +911,35 @@ export class StatusWidget implements Component {
 		}
 
 		if (matchesKey(data, Key.up)) {
-			const visibleCount = Math.min(VIEW_SIZE, total - this.scrollOffset);
-			const top = Math.max(0, VIEW_SIZE - visibleCount);
-			if (this.selectedRow > top) {
+			if (this.selectedRow > 0) {
 				this.selectedRow--;
 			} else if (this.scrollOffset + VIEW_SIZE < total) {
 				this.scrollOffset++;
+				this.clampSelectedRow(total);
 			}
 			this.tui?.requestRender();
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
-			if (this.selectedRow < VIEW_SIZE - 1
-				&& (this.scrollOffset + (VIEW_SIZE - 1 - this.selectedRow)) < total) {
+			if (this.selectedRow < this.visibleCount(total) - 1) {
 				this.selectedRow++;
 			} else if (this.scrollOffset > 0) {
 				this.scrollOffset--;
+				this.clampSelectedRow(total);
 			}
 			this.tui?.requestRender();
 			return;
 		}
+
+		// Any other key means the user is done reading and wants to type. Hand
+		// focus back to the editor and replay the keystroke into it, so no Esc or
+		// extra click is needed to resume composing.
+		const target = this.previousFocus;
+		if (!target) return;
+		if (data === "\r") this.bumpDecoy();
+		this.releaseFocus();
+		this.tui?.requestRender();
+		target.handleInput?.(data);
 	}
 
 	invalidate(): void {
@@ -639,11 +1096,11 @@ export class StatusWidget implements Component {
 	}
 
 	/**
-	 * Bottom border with a contextual focus hint cut in. Always visible, so
-	 * users discover ctrl+shift+r without poking around. Hint copy:
-	 *   - not focused                 -> "ctrl+shift+r focus"
-	 *   - focused                     -> "↑↓ navigate · esc release"
-	 *   - focused with older entries  -> "↑↓ navigate · esc release · +N older"
+	 * Bottom border with a contextual hint cut in. Always visible, so the mouse
+	 * affordances are discoverable without poking around:
+	 *   - not focused        -> "click or scroll" (+ "(↑N more)" when older
+	 *                           entries are out of view)
+	 *   - focused            -> "↑↓/wheel scroll · click/esc release" (+ "+N older")
 	 */
 	private renderBottomBorder(theme: Theme, width: number, totalEntries: number): string {
 		const borderColor = (s: string) => theme.fg("border", s);
@@ -651,11 +1108,11 @@ export class StatusWidget implements Component {
 
 		let hint: string;
 		if (!this.focused) {
-			hint = "ctrl+shift+r focus";
+			hint = olderCount > 0 ? `click or scroll (↑${olderCount} more)` : "click or scroll";
 		} else if (olderCount > 0) {
-			hint = `↑↓ navigate · esc release · +${olderCount} older`;
+			hint = `↑↓/wheel scroll · click/esc release · +${olderCount} older`;
 		} else {
-			hint = "↑↓ navigate · esc release";
+			hint = `↑↓/wheel scroll · click/esc release`;
 		}
 
 		// Same construction as the top border, but with the cut on the LEFT.

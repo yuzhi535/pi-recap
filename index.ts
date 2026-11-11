@@ -54,37 +54,73 @@ import {
 	setCachedRecapModel,
 	setNotice,
 	updateEntryText,
-} from "./state/store.js";
-import { replayFromBranch } from "./state/replay.js";
-import { getGlobalModelOverride, setGlobalModelOverride } from "./state/config.js";
-import { StatusWidget } from "./ui/status-widget.js";
+} from "./state/store.ts";
+import { replayFromBranch } from "./state/replay.ts";
+import { getGlobalModelOverride, getGlobalPosition, setGlobalModelOverride, setGlobalPosition } from "./state/config.ts";
+import type { PanelPosition } from "./state/config.ts";
+import { StatusWidget } from "./ui/status-widget.ts";
 import {
 	generateUserRecap,
 	generateAgentRecap,
 	listAvailableFastModels,
 	previewFirstPick,
-} from "./subagent/recap.js";
-import { deriveGoalInitial, deriveGoalRefine } from "./subagent/goal.js";
+} from "./subagent/recap.ts";
+import { deriveGoalInitial, deriveGoalRefine } from "./subagent/goal.ts";
 import {
 	addToBlacklist,
 	loadBlacklist,
 	removeFromBlacklist,
 	resetBlacklist,
 	seedBlacklist,
-} from "./state/blacklist.js";
-import { logError } from "./util/log.js";
+} from "./state/blacklist.ts";
+import { logError } from "./util/log.ts";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { showBenchmarkUI } from "pi-bench/ui.js";
+import { showBenchmarkUI } from "./vendor/pi-bench/ui.ts";
 import { Container, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
+/** Directory of this extension's own files (the entry point sits in it). */
+const RECAP_ROOT = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Can the bundled /bench runner start on this Pi build?
+ *
+ * The vendored runner imports a host export that current Pi releases no
+ * longer provide. That import is deliberately NOT pulled in at load time: it
+ * only matters when the user asks for a benchmark, so the check happens here
+ * and a missing export turns into a plain message instead of a crash. Recap
+ * summarization itself never touches this path.
+ */
+async function benchRunnerSupport(): Promise<{ ok: true } | { ok: false; detail: string }> {
+	try {
+		const host = (await import("@earendil-works/pi-coding-agent")) as Record<string, unknown>;
+		const missing = ["AuthStorage", "ModelRegistry", "discoverAndLoadExtensions"].filter(
+			(name) => !(name in host),
+		);
+		if (missing.length > 0) {
+			return { ok: false, detail: `this Pi build does not export ${missing.join(", ")}` };
+		}
+		return { ok: true };
+	} catch (err) {
+		return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+	}
+}
+
 /** How long the session-start notice toast stays visible before the
  *  title-right slot reverts to the model tag. */
 const NOTICE_DURATION_MS = 2500;
+
+/** Session generation counter. Bumped on every session start and shutdown.
+ *  Background work captures the value at launch and abandons itself after an
+ *  await if it changed: a task started in session A must never write state,
+ *  rename the session, or repaint the widget after the host switched to
+ *  session B (those writes hit a stale event context and can tear down the
+ *  extension host). */
+let sessionGen = 0;
 
 /** Extract the session id from the event context. */
 function sid(ctx: { sessionManager: { getSessionId(): string } }): string {
@@ -119,26 +155,34 @@ function scanBranch(
  *  re-load as a zombie spinner. The transient `notice` field is intentionally
  *  not persisted so toasts never resurrect on session reload. */
 function persistState(sessionId: string, pi: ExtensionAPI): void {
-	const state = getState(sessionId);
-	pi.appendEntry("recap", {
-		goal: state.goal,
-		goalSource: state.goalSource,
-		goalAutoTurnsApplied: state.goalAutoTurnsApplied,
-		status: state.status,
-		history: state.history
-			.filter((h) => !h.streaming)
-			.map((h) => ({
-				id: h.id,
-				timestamp: h.timestamp,
-				recap: h.recap,
-				speaker: h.speaker,
-			})),
-		nextId: state.nextId,
-		lastModel: state.lastModel,
-		modelOverride: state.modelOverride,
-		cachedRecapModel: state.cachedRecapModel,
-		cachedGoalModel: state.cachedGoalModel,
-	});
+	try {
+		const state = getState(sessionId);
+		pi.appendEntry("recap", {
+			goal: state.goal,
+			goalSource: state.goalSource,
+			goalAutoTurnsApplied: state.goalAutoTurnsApplied,
+			status: state.status,
+			history: state.history
+				.filter((h) => !h.streaming)
+				.map((h) => ({
+					id: h.id,
+					timestamp: h.timestamp,
+					recap: h.recap,
+					speaker: h.speaker,
+				})),
+			nextId: state.nextId,
+			lastModel: state.lastModel,
+			modelOverride: state.modelOverride,
+			cachedRecapModel: state.cachedRecapModel,
+			cachedGoalModel: state.cachedGoalModel,
+		});
+	} catch (err) {
+		// The event context can be stale by the time a background task reaches
+		// this write (session switched, reloaded, or shut down). Every caller is
+		// fire-and-forget, so a throw would surface as an unhandled rejection
+		// that takes the whole host down. Log and move on.
+		logError("persistState failed:", err);
+	}
 }
 
 /**
@@ -206,6 +250,7 @@ export default function (pi: ExtensionAPI) {
 	// ── Session lifecycle ──────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionGen++;
 		const sessionId = sid(ctx);
 		setActiveSessionId(sessionId);
 		replaceState(sessionId, replayFromBranch(ctx));
@@ -282,6 +327,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		sessionGen++;
 		terminalInputUnsub?.();
 		terminalInputUnsub = undefined;
 		dropSession(sid(ctx));
@@ -322,10 +368,12 @@ export default function (pi: ExtensionAPI) {
 
 		const before = getState(sessionId);
 		const sessionModel = ctx.model;
+		const gen = sessionGen;
 		void (async () => {
 			try {
 				const { result, cachedWinnerCleared } = await generateUserRecap(prompt, ctx.modelRegistry, {
 					onDelta: (running) => {
+						if (gen !== sessionGen) return;
 						updateEntryText(sessionId, entryId, running);
 						statusWidget?.update();
 					},
@@ -333,6 +381,7 @@ export default function (pi: ExtensionAPI) {
 					sessionModel,
 					cachedWinner: before.cachedRecapModel,
 				});
+				if (gen !== sessionGen) return;
 				if (cachedWinnerCleared) clearCachedRecapModel(sessionId);
 				if (!result) {
 					removeEntry(sessionId, entryId);
@@ -344,13 +393,14 @@ export default function (pi: ExtensionAPI) {
 				persistState(sessionId, pi);
 				statusWidget?.update();
 			} catch (err) {
+				if (gen !== sessionGen) return;
 				logError("user recap failed:", err);
 				updateEntryText(sessionId, entryId, "⚠️ Recap failed. Use /recap to pick another model. (For best results, use the benchmark)");
 				finalizeEntry(sessionId, entryId, "⚠️ Recap failed. Use /recap to pick another model. (For best results, use the benchmark)", before.modelOverride || "error");
 				persistState(sessionId, pi);
 				statusWidget?.update();
 			}
-		})();
+		})().catch((err) => logError("user recap background task error:", err));
 	});
 
 	// ── Stop decoy when agent starts streaming output ─────────────
@@ -385,6 +435,7 @@ export default function (pi: ExtensionAPI) {
 		if (shouldDeriveGoal) {
 			const isFirst = before.goalAutoTurnsApplied === 0;
 			const sessionModel = ctx.model;
+			const gen = sessionGen;
 			const goalOpts = {
 				preferredModelId: before.modelOverride,
 				sessionModel,
@@ -395,6 +446,7 @@ export default function (pi: ExtensionAPI) {
 					const { result, cachedWinnerCleared } = isFirst
 						? await deriveGoalInitial(branchMessages, ctx.modelRegistry, goalOpts)
 						: await deriveGoalRefine(before.goal, branchMessages, ctx.modelRegistry, goalOpts);
+					if (gen !== sessionGen) return;
 					if (cachedWinnerCleared) clearCachedGoalModel(sessionId);
 					const current = getState(sessionId);
 					if (current.goalSource === "manual") return; // manual lock landed in-flight
@@ -407,6 +459,7 @@ export default function (pi: ExtensionAPI) {
 						goalAutoTurnsApplied: Math.min(2, userTurnCount),
 					});
 					persistState(sessionId, pi);
+					if (gen !== sessionGen) return;
 					statusWidget?.update();
 					// Mirror into pi's session label. Fire-and-forget; if pi
 					// throws here it must NOT tank the widget update above.
@@ -418,9 +471,10 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 				} catch (err) {
+					if (gen !== sessionGen) return;
 					logError("goal derivation failed:", err);
 				}
-			})();
+			})().catch((err) => logError("goal background task error:", err));
 		}
 
 		// Agent recap: own entry id, runs concurrently with the user-recap
@@ -429,6 +483,7 @@ export default function (pi: ExtensionAPI) {
 		statusWidget?.update();
 
 		void (async () => {
+			const gen = sessionGen;
 			const beforeAgent = getState(sessionId);
 			try {
 				const { result, cachedWinnerCleared } = await generateAgentRecap(
@@ -436,6 +491,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.modelRegistry,
 					{
 						onDelta: (running) => {
+							if (gen !== sessionGen) return;
 							updateEntryText(sessionId, entryId, running);
 							statusWidget?.update();
 						},
@@ -444,6 +500,7 @@ export default function (pi: ExtensionAPI) {
 						cachedWinner: beforeAgent.cachedRecapModel,
 					},
 				);
+				if (gen !== sessionGen) return;
 				if (cachedWinnerCleared) clearCachedRecapModel(sessionId);
 				if (!result) {
 					removeEntry(sessionId, entryId);
@@ -455,22 +512,25 @@ export default function (pi: ExtensionAPI) {
 				persistState(sessionId, pi);
 				statusWidget?.update();
 			} catch (err) {
+				if (gen !== sessionGen) return;
 				logError("agent recap failed:", err);
 				updateEntryText(sessionId, entryId, "⚠️ Recap failed. Use /recap to pick another model. (For best results, use the benchmark)");
 				finalizeEntry(sessionId, entryId, "⚠️ Recap failed. Use /recap to pick another model. (For best results, use the benchmark)", beforeAgent.modelOverride || "error");
 				persistState(sessionId, pi);
 				statusWidget?.update();
 			}
-		})();
+		})().catch((err) => logError("recap background task error:", err));
 	});
 
 	// ── Keyboard shortcut: ctrl+shift+r - focus the recap panel ──
 	// Plain ctrl+r is the built-in app.session.rename, so we use the shift
 	// variant. Shortcut flips focus to the StatusWidget so arrow keys route
-	// to its handleInput. Esc or ctrl+shift+r again releases.
+	// to its handleInput. Esc or ctrl+shift+r again releases. The panel is also
+	// clickable and scrollable with the mouse, so this key is only a fallback
+	// for terminals or keyboards where the shortcut never reaches us.
 
 	pi.registerShortcut("ctrl+shift+r", {
-		description: "Focus the recap panel (arrows to navigate, esc to release)",
+		description: "Focus the recap panel (or click/scroll it; arrows to navigate, esc to release)",
 		handler: async (ctx) => {
 			if (!ctx.hasUI) return;
 			statusWidget?.toggleFocus();
@@ -480,7 +540,7 @@ export default function (pi: ExtensionAPI) {
 	// ── Slash command: /recap - unified interactive menu ──────────
 
 	pi.registerCommand("recap", {
-		description: "Manage session goal, recap model, and blacklist",
+		description: "Manage session goal, recap model, panel position, and blacklist",
 		handler: async (_args, ctx) => {
 			const sessionId = sid(ctx);
 			const current = getState(sessionId);
@@ -497,6 +557,14 @@ export default function (pi: ExtensionAPI) {
 			const clearModelLabel = "   └─ Reset model to auto-pick";
 			const benchLabel = "⚡ Benchmark models & pick fastest";
 
+			// Position setting: panel above the input box (the default every
+			// earlier version used) or pinned to the top of a fullscreen window.
+			const positionAboveLabel = "Above the editor (default)";
+			const positionTopLabel = "Top of screen (pinned)";
+			const positionLabel = getGlobalPosition() === "top"
+				? `📍 Position: ${positionTopLabel}`
+				: `📍 Position: ${positionAboveLabel}`;
+
 			const bl = loadBlacklist();
 			const blLabel = `🚫 Manage Blacklist (${bl.entries.length} items)`;
 
@@ -505,6 +573,7 @@ export default function (pi: ExtensionAPI) {
 				...(current.goal ? [clearGoalLabel] : []),
 				modelLabel,
 				...(current.modelOverride ? [clearModelLabel] : []),
+				positionLabel,
 				benchLabel,
 				blLabel,
 			];
@@ -570,13 +639,37 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// ── Panel position ───────────────────────────────────
+
+			if (choice === positionLabel) {
+				const picked = await ctx.ui.select("Recap panel position", [positionAboveLabel, positionTopLabel]);
+				if (!picked) return; // dismissed
+				const next: PanelPosition = picked === positionTopLabel ? "top" : "aboveEditor";
+				setGlobalPosition(next);
+				// Re-place the card right away instead of waiting for the next turn.
+				statusWidget?.setPosition(next);
+				statusWidget?.update();
+				ctx.ui.notify(
+					next === "top"
+						? "Recap panel pinned to the top of the screen (fullscreen). Saved globally."
+						: "Recap panel back above the editor. Saved globally.",
+					"info",
+				);
+				return;
+			}
+
 			// ── Bench & pick fastest ─────────────────────────────
 
 			if (choice === benchLabel) {
-				const benchScript = path.join(
-					path.dirname(fileURLToPath(import.meta.resolve("pi-bench/package.json"))),
-					"bench.mts",
-				);
+				const support = await benchRunnerSupport();
+				if (!support.ok) {
+					ctx.ui.notify(
+						`Benchmark unavailable: the bundled runner needs a host API that ${support.detail}. Recap summaries are unaffected; pick a model with /recap-model instead.`,
+						"warning",
+					);
+					return;
+				}
+				const benchScript = path.join(RECAP_ROOT, "vendor", "pi-bench", "bench.mts");
 				const outputDir = path.dirname(benchScript);
 				const csvPath = path.join(outputDir, "bench-results-v6.csv");
 
