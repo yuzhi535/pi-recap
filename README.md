@@ -36,9 +36,10 @@ git clone https://github.com/yuzhi535/pi-recap.git ~/.pi/agent/extensions/pi-rec
 
 Restart pi. The recap panel appears above the editor after your first message.
 
-Alternatively install it as a Pi package: `pi install git:github.com/yuzhi535/pi-recap`. Pi then
-keeps its own copy of the files, while the panel's state stays at
-`~/.pi/agent/extensions/pi-recap/state/` (set `PI_RECAP_HOME` to move the state root).
+Alternatively install it as a Pi package: `pi install git:github.com/yuzhi535/pi-recap@v0.9.0`.
+Use `@main` to follow the branch instead of the tagged release. Pi then keeps its own copy of the
+files, while the panel's state stays at `~/.pi/agent/extensions/pi-recap/state/` (set
+`PI_RECAP_HOME` to move the state root).
 
 ## Usage
 
